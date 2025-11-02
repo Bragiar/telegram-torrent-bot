@@ -11,13 +11,22 @@ use crate::jackett::{
     dispatch_from_reply, format_telegram_response, request_jackett, TelegramJackettResponse,
     TorrentLocation,
 };
-use crate::transmission::{add_torrent, Media};
+use crate::transmission::{
+    add_torrent, delete_torrent, get_media_type_from_path, get_storage_info, get_torrents,
+    stop_seeding_all, Media, Torrent,
+};
 
 const HELP: &str = "
 /torrent-tv (Magnet Link)
 /torrent-movie (Magnet Link)
 /search (Movie or TV Show e.g. The Matrix or Simpsons s01e01)
 /imdb (Imdb link). Requires omdb token set https://www.omdbapi.com/
+/status - Get status of active downloads
+/delete-torrent - List all downloads (reply with number to delete torrent)
+/delete-tv - List TV shows files (reply with number to delete file)
+/delete-movie - List movie files (reply with number to delete file)
+/stop-seed - Stop seeding for all downloads
+/storage - Get available storage information
 
 Reply the magnet links with:
 Position of the torrent
@@ -113,6 +122,212 @@ async fn pick_choices(
     Ok("🧲 Added torrent".to_string())
 }
 
+async fn dispatch_status() -> Result<String, String> {
+    use size_format::SizeFormatterSI;
+    
+    let torrents = get_torrents().await?;
+
+    if torrents.is_empty() {
+        return Ok("📊 No active downloads".to_string());
+    }
+
+    let mut status = String::from("📊 Active Downloads:\n\n");
+
+    for torrent in &torrents {
+        let percent = (torrent.percent_done * 100.0) as i64;
+        let status_emoji = match torrent.status {
+            0 => "⏸️",  // Stopped
+            1 => "⏳",   // Queued to verify
+            2 => "🔍",   // Verifying
+            3 => "⏳",   // Queued to download
+            4 => "⬇️",   // Downloading
+            5 => "⏳",   // Queued to seed
+            6 => "⬆️",   // Seeding
+            _ => "❓",
+        };
+
+        let size_str = SizeFormatterSI::new(torrent.total_size as u64).to_string();
+        
+        status.push_str(&format!(
+            "{} {} ({}%)\n  Size: {}, Downloaded: {}, Uploaded: {}\n",
+            status_emoji,
+            torrent.name,
+            percent,
+            size_str,
+            SizeFormatterSI::new(torrent.downloaded_ever as u64).to_string(),
+            SizeFormatterSI::new(torrent.uploaded_ever as u64).to_string()
+        ));
+    }
+
+    Ok(status)
+}
+
+fn format_torrent_list(torrents: &[Torrent], filter: Option<Media>) -> (String, Vec<i64>) {
+    let mut list = String::new();
+    let mut ids = Vec::new();
+
+    let tv_path = env::var("TRANSMISSION_TV_PATH").unwrap_or_default();
+    let movie_path = env::var("TRANSMISSION_MOVIE_PATH").unwrap_or_default();
+
+    let mut number = 1;
+    for torrent in torrents {
+        let media_type = get_media_type_from_path(&torrent.download_dir, &tv_path, &movie_path);
+
+        if let Some(filter_media) = &filter {
+            if media_type.as_ref() != Some(filter_media) {
+                continue;
+            }
+        }
+
+        let media_label = match media_type {
+            Some(Media::TV) => "📺 TV",
+            Some(Media::Movie) => "🎬 Movie",
+            None => "📁 Unknown",
+        };
+
+        let percent = (torrent.percent_done * 100.0) as i64;
+
+        list.push_str(&format!(
+            "{}. {} - {} ({}%)\n",
+            number, media_label, torrent.name, percent
+        ));
+        ids.push(torrent.id);
+        number += 1;
+    }
+
+    if list.is_empty() {
+        list = "No downloads found".to_string();
+    } else {
+        list.insert_str(0, "Reply with the number to delete:\n\n");
+    }
+
+    (list, ids)
+}
+
+async fn dispatch_delete_list(filter: Option<Media>) -> Result<(String, Vec<i64>), String> {
+    let torrents = get_torrents().await?;
+    Ok(format_torrent_list(&torrents, filter))
+}
+
+async fn dispatch_delete(
+    index: usize,
+    torrent_ids: Vec<i64>,
+) -> Result<String, String> {
+    if index == 0 || index > torrent_ids.len() {
+        return Err("Invalid index".to_string());
+    }
+
+    let id = torrent_ids[index - 1];
+    delete_torrent(vec![id]).await?;
+
+    Ok("🗑️ Torrent deleted".to_string())
+}
+
+async fn dispatch_stop_seed() -> Result<String, String> {
+    stop_seeding_all().await?;
+    Ok("⏹️ Stopped seeding for all downloads".to_string())
+}
+
+async fn dispatch_storage() -> Result<String, String> {
+    get_storage_info()
+}
+
+fn list_files_in_directory(dir_path: &str) -> Result<Vec<String>, String> {
+    use std::fs;
+    
+    let entries = fs::read_dir(dir_path)
+        .map_err(|e| format!("Failed to read directory {}: {}", dir_path, e))?;
+    
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
+        let path = entry.path();
+        
+        if path.is_dir() || path.is_file() {
+            if let Some(file_name) = path.file_name() {
+                if let Some(name_str) = file_name.to_str() {
+                    // Skip hidden files
+                    if !name_str.starts_with('.') {
+                        files.push(path.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    }
+    
+    // Sort files alphabetically
+    files.sort();
+    Ok(files)
+}
+
+fn format_file_list(files: &[String], _base_path: &str) -> (String, Vec<String>) {
+    let mut list = String::new();
+    let mut paths = Vec::new();
+
+    let mut number = 1;
+    for file_path in files {
+        // Get just the file/folder name
+        let display_name = std::path::Path::new(file_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(file_path);
+        
+        list.push_str(&format!(
+            "{}. {}\n",
+            number, display_name
+        ));
+        paths.push(file_path.clone());
+        number += 1;
+    }
+
+    if list.is_empty() {
+        list = "No files found".to_string();
+    } else {
+        list.insert_str(0, "Reply with the number to delete:\n\n");
+    }
+
+    (list, paths)
+}
+
+async fn dispatch_delete_file_list(media: Media) -> Result<(String, Vec<String>), String> {
+    let path = match media {
+        Media::TV => env::var("TRANSMISSION_TV_PATH")
+            .map_err(|_| "TRANSMISSION_TV_PATH env var is not set".to_string())?,
+        Media::Movie => env::var("TRANSMISSION_MOVIE_PATH")
+            .map_err(|_| "TRANSMISSION_MOVIE_PATH env var is not set".to_string())?,
+    };
+
+    let files = list_files_in_directory(&path)?;
+    Ok(format_file_list(&files, &path))
+}
+
+async fn dispatch_delete_file(
+    index: usize,
+    file_paths: Vec<String>,
+) -> Result<String, String> {
+    use std::fs;
+    use std::path::Path;
+    
+    if index == 0 || index > file_paths.len() {
+        return Err("Invalid index".to_string());
+    }
+
+    let file_path = &file_paths[index - 1];
+    let path = Path::new(file_path);
+
+    if path.is_dir() {
+        fs::remove_dir_all(path)
+            .map_err(|e| format!("Failed to delete directory: {}", e))?;
+        Ok(format!("🗑️ Directory deleted: {}", path.file_name().unwrap_or_default().to_string_lossy()))
+    } else if path.is_file() {
+        fs::remove_file(path)
+            .map_err(|e| format!("Failed to delete file: {}", e))?;
+        Ok(format!("🗑️ File deleted: {}", path.file_name().unwrap_or_default().to_string_lossy()))
+    } else {
+        Err("Path does not exist".to_string())
+    }
+}
+
 pub async fn send_message(api: &Api, message: &Message, text: String) -> Result<(), ()> {
     let mut reply = message.text_reply(text);
 
@@ -145,11 +360,41 @@ async fn add_response(
     }
 }
 
+async fn add_torrent_list(
+    text: String,
+    torrent_ids: Vec<i64>,
+    torrent_lists: &mut Arc<Mutex<Vec<(Vec<i64>, String)>>>,
+) -> String {
+    let mut lists = torrent_lists.lock().await;
+    lists.push((torrent_ids, text.clone()));
+    // Keep only last 100 lists to avoid memory issues
+    if lists.len() > 100 {
+        lists.remove(0);
+    }
+    text
+}
+
+async fn add_file_list(
+    text: String,
+    file_paths: Vec<String>,
+    file_lists: &mut Arc<Mutex<Vec<(Vec<String>, String)>>>,
+) -> String {
+    let mut lists = file_lists.lock().await;
+    lists.push((file_paths, text.clone()));
+    // Keep only last 100 lists to avoid memory issues
+    if lists.len() > 100 {
+        lists.remove(0);
+    }
+    text
+}
+
 pub async fn handle_message(
     api: &Api,
     message: &Message,
     text: Vec<String>,
     responses: &mut Arc<Mutex<Vec<TelegramJackettResponse>>>,
+    torrent_lists: &mut Arc<Mutex<Vec<(Vec<i64>, String)>>>,
+    file_lists: &mut Arc<Mutex<Vec<(Vec<String>, String)>>>,
 ) -> Result<(), ()> {
     let chat_id = message.chat.id();
     let mut result: Result<String, String> = Err("🤷🏻‍I didn't get it!".to_string());
@@ -182,8 +427,40 @@ pub async fn handle_message(
 
             if let Some(num) = num {
                 if let Some(reply_text) = reply.text() {
-                    let r = responses.lock().await;
-                    result = pick_choices(num, reply_text, r.clone(), media).await;
+                    let mut matched = false;
+                    
+                    // Check if this is a reply to a file delete list
+                    {
+                        let file_lists_guard = file_lists.lock().await;
+                        for (file_paths, list_text) in file_lists_guard.iter() {
+                            if reply_text == list_text.as_str() || reply_text.contains("Reply with the number to delete") {
+                                let paths = file_paths.clone();
+                                drop(file_lists_guard);
+                                result = dispatch_delete_file(num as usize, paths).await;
+                                matched = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    // Check if this is a reply to a torrent delete list
+                    if !matched {
+                        let lists = torrent_lists.lock().await;
+                        for (torrent_ids, list_text) in lists.iter() {
+                            if reply_text == list_text.as_str() || reply_text.contains("Reply with the number to delete") {
+                                result = dispatch_delete(num as usize, torrent_ids.clone()).await;
+                                matched = true;
+                                break;
+                            }
+                        }
+                        drop(lists);
+                    }
+
+                    // If not a delete reply, try Jackett response
+                    if !matched {
+                        let r = responses.lock().await;
+                        result = pick_choices(num, reply_text, r.clone(), media).await;
+                    }
                 }
             } else {
                 result = Err(
@@ -217,6 +494,27 @@ pub async fn handle_message(
                 let response = dispatch_search(text).await;
                 add_response(response, responses).await
             }
+            "/status" => dispatch_status().await,
+            "/delete-torrent" => {
+                match dispatch_delete_list(None).await {
+                    Ok((text, ids)) => Ok(add_torrent_list(text, ids, torrent_lists).await),
+                    Err(e) => Err(e),
+                }
+            }
+            "/delete-tv" => {
+                match dispatch_delete_file_list(Media::TV).await {
+                    Ok((text, paths)) => Ok(add_file_list(text, paths, file_lists).await),
+                    Err(e) => Err(e),
+                }
+            }
+            "/delete-movie" => {
+                match dispatch_delete_file_list(Media::Movie).await {
+                    Ok((text, paths)) => Ok(add_file_list(text, paths, file_lists).await),
+                    Err(e) => Err(e),
+                }
+            }
+            "/stop-seed" => dispatch_stop_seed().await,
+            "/storage" => dispatch_storage().await,
             _ => result,
         };
     }

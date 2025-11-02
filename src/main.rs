@@ -43,6 +43,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let responses: Arc<Mutex<Vec<TelegramJackettResponse>>> = Arc::new(Mutex::new(Vec::new()));
+    let torrent_lists: Arc<Mutex<Vec<(Vec<i64>, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let file_lists: Arc<Mutex<Vec<(Vec<String>, String)>>> = Arc::new(Mutex::new(Vec::new()));
 
     let telegram_token = env::var("TELEGRAM_BOT_TOKEN").expect("TELEGRAM_BOT_TOKEN not set");
 
@@ -66,10 +68,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let text = data.split_whitespace().map(|s| s.to_string()).collect();
         let cloned_api = api.clone();
         let mut shared_responses = Arc::clone(&responses);
+        let mut shared_torrent_lists = Arc::clone(&torrent_lists);
+        let mut shared_file_lists = Arc::clone(&file_lists);
         let data_cloned = data.clone();
 
         tokio::spawn(async move {
-            let handle = handle_message(&cloned_api, &message, text, &mut shared_responses);
+            let handle = handle_message(&cloned_api, &message, text, &mut shared_responses, &mut shared_torrent_lists, &mut shared_file_lists);
             if (handle.await).is_err() {
                 let error_msg = format!(
                     "Errors should be handled in handle_message {:?}",

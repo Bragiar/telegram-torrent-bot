@@ -1,3 +1,4 @@
 target/
 
 telegram-bot-torrents*
+.env
