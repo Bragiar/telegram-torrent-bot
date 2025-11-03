@@ -2,7 +2,7 @@ use std::env;
 
 use futures::lock::Mutex;
 use telegram_bot::prelude::*;
-use telegram_bot::{Api, ChatId, Message, ParseMode};
+use telegram_bot::{Api, ChatId, Message, MessageId, ParseMode};
 
 use std::sync::Arc;
 
@@ -198,7 +198,7 @@ fn format_torrent_list(torrents: &[Torrent], filter: Option<Media>) -> (String, 
     if list.is_empty() {
         list = "No downloads found".to_string();
     } else {
-        list.insert_str(0, "Reply with the number to delete:\n\n");
+        list.insert_str(0, "Reply with the number to delete (torrent):\n\n");
     }
 
     (list, ids)
@@ -283,7 +283,7 @@ fn format_file_list(files: &[String], _base_path: &str) -> (String, Vec<String>)
     if list.is_empty() {
         list = "No files found".to_string();
     } else {
-        list.insert_str(0, "Reply with the number to delete:\n\n");
+        list.insert_str(0, "Reply with the number to delete (file):\n\n");
     }
 
     (list, paths)
@@ -328,20 +328,30 @@ async fn dispatch_delete_file(
     }
 }
 
-pub async fn send_message(api: &Api, message: &Message, text: String) -> Result<(), ()> {
+pub async fn send_message(api: &Api, message: &Message, text: String) -> Result<Option<MessageId>, ()> {
     let mut reply = message.text_reply(text);
 
     let result = api.send(reply.parse_mode(ParseMode::Html)).await;
     match result {
-        Ok(_) => {
-            println!("Reply: {:?}", reply);
-            Ok(())
+        Ok(sent_msg) => {
+            use telegram_bot::MessageOrChannelPost;
+            let msg_id = match sent_msg {
+                MessageOrChannelPost::Message(m) => m.id,
+                MessageOrChannelPost::ChannelPost(cp) => cp.id,
+            };
+            println!("Reply sent with id: {:?}", msg_id);
+            Ok(Some(msg_id))
         }
         Err(err) => {
             println!("Error when sending telegram message: {}", err);
-            Ok(())
+            Ok(None)
         }
     }
+}
+// Holds a pending list to be stored after message is sent and message ID is known
+enum PendingList {
+    Torrent(Vec<i64>),
+    File(Vec<String>),
 }
 
 async fn add_response(
@@ -363,10 +373,11 @@ async fn add_response(
 async fn add_torrent_list(
     text: String,
     torrent_ids: Vec<i64>,
-    torrent_lists: &mut Arc<Mutex<Vec<(Vec<i64>, String)>>>,
+    torrent_lists: &mut Arc<Mutex<Vec<(Vec<i64>, String, MessageId)>>>,
+    message_id: MessageId,
 ) -> String {
     let mut lists = torrent_lists.lock().await;
-    lists.push((torrent_ids, text.clone()));
+    lists.push((torrent_ids, text.clone(), message_id));
     // Keep only last 100 lists to avoid memory issues
     if lists.len() > 100 {
         lists.remove(0);
@@ -377,10 +388,11 @@ async fn add_torrent_list(
 async fn add_file_list(
     text: String,
     file_paths: Vec<String>,
-    file_lists: &mut Arc<Mutex<Vec<(Vec<String>, String)>>>,
+    file_lists: &mut Arc<Mutex<Vec<(Vec<String>, String, MessageId)>>>,
+    message_id: MessageId,
 ) -> String {
     let mut lists = file_lists.lock().await;
-    lists.push((file_paths, text.clone()));
+    lists.push((file_paths, text.clone(), message_id));
     // Keep only last 100 lists to avoid memory issues
     if lists.len() > 100 {
         lists.remove(0);
@@ -393,11 +405,12 @@ pub async fn handle_message(
     message: &Message,
     text: Vec<String>,
     responses: &mut Arc<Mutex<Vec<TelegramJackettResponse>>>,
-    torrent_lists: &mut Arc<Mutex<Vec<(Vec<i64>, String)>>>,
-    file_lists: &mut Arc<Mutex<Vec<(Vec<String>, String)>>>,
+    torrent_lists: &mut Arc<Mutex<Vec<(Vec<i64>, String, MessageId)>>>,
+    file_lists: &mut Arc<Mutex<Vec<(Vec<String>, String, MessageId)>>>,
 ) -> Result<(), ()> {
     let chat_id = message.chat.id();
     let mut result: Result<String, String> = Err("🤷🏻‍I didn't get it!".to_string());
+    let mut pending_list: Option<PendingList> = None;
 
     let prefix = text.first().unwrap();
     let suffix = text.last().unwrap();
@@ -429,11 +442,15 @@ pub async fn handle_message(
                 if let Some(reply_text) = reply.text() {
                     let mut matched = false;
                     
-                    // Check if this is a reply to a file delete list
+                    // 1) check FILE lists only if reply_text exactly matches a stored FILE list text
                     {
                         let file_lists_guard = file_lists.lock().await;
-                        for (file_paths, list_text) in file_lists_guard.iter() {
-                            if reply_text == list_text.as_str() || reply_text.contains("Reply with the number to delete") {
+                        for (file_paths, _list_text, stored_id) in file_lists_guard.iter() {
+                            let reply_msg_id = match *reply {
+                                telegram_bot::MessageOrChannelPost::Message(ref m) => m.id,
+                                telegram_bot::MessageOrChannelPost::ChannelPost(ref cp) => cp.id,
+                            };
+                            if reply_msg_id == *stored_id {
                                 let paths = file_paths.clone();
                                 drop(file_lists_guard);
                                 result = dispatch_delete_file(num as usize, paths).await;
@@ -443,11 +460,15 @@ pub async fn handle_message(
                         }
                     }
 
-                    // Check if this is a reply to a torrent delete list
+                    // 2) if not matched, check TORRENT lists only if reply_text exactly matches a stored TORRENT list text
                     if !matched {
                         let lists = torrent_lists.lock().await;
-                        for (torrent_ids, list_text) in lists.iter() {
-                            if reply_text == list_text.as_str() || reply_text.contains("Reply with the number to delete") {
+                        for (torrent_ids, _list_text, stored_id) in lists.iter() {
+                            let reply_msg_id = match *reply {
+                                telegram_bot::MessageOrChannelPost::Message(ref m) => m.id,
+                                telegram_bot::MessageOrChannelPost::ChannelPost(ref cp) => cp.id,
+                            };
+                            if reply_msg_id == *stored_id {
                                 result = dispatch_delete(num as usize, torrent_ids.clone()).await;
                                 matched = true;
                                 break;
@@ -497,19 +518,28 @@ pub async fn handle_message(
             "/status" => dispatch_status().await,
             "/delete-torrent" => {
                 match dispatch_delete_list(None).await {
-                    Ok((text, ids)) => Ok(add_torrent_list(text, ids, torrent_lists).await),
+                    Ok((text, ids)) => {
+                        pending_list = Some(PendingList::Torrent(ids));
+                        Ok(text)
+                    }
                     Err(e) => Err(e),
                 }
             }
             "/delete-tv" => {
                 match dispatch_delete_file_list(Media::TV).await {
-                    Ok((text, paths)) => Ok(add_file_list(text, paths, file_lists).await),
+                    Ok((text, paths)) => {
+                        pending_list = Some(PendingList::File(paths));
+                        Ok(text)
+                    }
                     Err(e) => Err(e),
                 }
             }
             "/delete-movie" => {
                 match dispatch_delete_file_list(Media::Movie).await {
-                    Ok((text, paths)) => Ok(add_file_list(text, paths, file_lists).await),
+                    Ok((text, paths)) => {
+                        pending_list = Some(PendingList::File(paths));
+                        Ok(text)
+                    }
                     Err(e) => Err(e),
                 }
             }
@@ -523,11 +553,23 @@ pub async fn handle_message(
     match result {
         Ok(text) => {
             if !text.is_empty() {
-                send_message(api, message, text.clone()).await?;
+                if let Ok(sent_id_opt) = send_message(api, message, text.clone()).await {
+                    if let (Some(sent_id), Some(pending)) = (sent_id_opt, pending_list) {
+                        match pending {
+                            PendingList::Torrent(ids) => {
+                                // store mapping for replies to this message
+                                let _ = add_torrent_list(text, ids, torrent_lists, sent_id).await;
+                            }
+                            PendingList::File(paths) => {
+                                let _ = add_file_list(text, paths, file_lists, sent_id).await;
+                            }
+                        }
+                    }
+                }
             }
         }
         Err(text) => {
-            send_message(api, message, format!("❌ {}", text.clone())).await?;
+            let _ = send_message(api, message, format!("❌ {}", text.clone())).await?;
         }
     };
     Ok(())

@@ -183,29 +183,69 @@ fn is_tv_show(categories: Vec<i64>) -> bool {
     return categories.iter().any(|c| c >= &3000 && c < &4000);
 }
 
-pub async fn get_torrent_file_content(torrent_url: String) -> Result<String, String> {
+fn is_debug_enabled() -> bool {
+    env::var("DEBUG_TORRENT").is_ok()
+}
+
+pub async fn get_torrent_location_from_url(torrent_url: String) -> Result<TorrentLocation, String> {
+    use hyper::header::{LOCATION, USER_AGENT};
+    use hyper::{Body, Request};
+    use url::Url;
+
     let https = hyper_rustls::HttpsConnector::with_native_roots();
     let client: client::Client<_> = client::Client::builder().build(https);
-    let url = Uri::from_str(&torrent_url);
+    let mut current = torrent_url.clone();
+    let mut redirects = 0usize;
 
-    if let Err(err) = url {
-        return Err(format!("Broken Jackett url {}", err));
+    loop {
+        if redirects > 5 {
+            return Err(format!("Too many redirects while fetching torrent: {}", current));
+        }
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(&current)
+            .header(USER_AGENT, "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = client.request(req).await.map_err(|e| e.to_string())?;
+        let status = resp.status();
+
+        if status.is_redirection() {
+            let loc = resp.headers().get(LOCATION).and_then(|v| v.to_str().ok());
+            if let Some(loc) = loc {
+                let next = Url::parse(&current)
+                    .ok()
+                    .and_then(|base| base.join(loc).ok())
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|| loc.to_string());
+
+                if next.starts_with("magnet:") {
+                    // ✅ Treat redirect-to-magnet as a magnet torrent
+                    return Ok(TorrentLocation { content: next, is_magnet: true });
+                }
+
+                current = next;
+                redirects += 1;
+                continue;
+            } else {
+                return Err("Redirect response without Location header".to_string());
+            }
+        }
+
+        // 200 OK — expect a .torrent file body
+        let content = hyper::body::to_bytes(resp.into_body())
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if content.is_empty() {
+            return Err(format!("Torrent file download returned empty content. URL: {}", current));
+        }
+
+        // ✅ Return base64-encoded .torrent
+        return Ok(TorrentLocation { content: base64::encode(content), is_magnet: false });
     }
-
-    let link_response = client.get(url.unwrap()).await;
-
-    if let Err(err) = link_response {
-        return Err(format!("Error when getting the link: {}", err));
-    }
-
-    let body: Body = link_response.unwrap().into_body();
-    let body = to_bytes(body).await;
-
-    if let Err(err) = body {
-        return Err(format!("Error {}", err));
-    }
-
-    return Ok(base64::encode(body.unwrap()));
 }
 
 pub async fn dispatch_from_reply(
@@ -234,15 +274,33 @@ pub async fn dispatch_from_reply(
                     let location: TorrentLocation;
 
                     if torrent.magnet_uri.is_some() {
-                        location = TorrentLocation { content: torrent.magnet_uri.clone().unwrap(), is_magnet: true };
+                        let magnet = torrent.magnet_uri.clone().unwrap();
+                        if is_debug_enabled() {
+                            println!("[DEBUG] Using magnet URI (length: {})", magnet.len());
+                        }
+                        if magnet.is_empty() {
+                            return Err("Torrent has empty magnet URI. Please select another".to_string());
+                        }
+                        location = TorrentLocation { content: magnet, is_magnet: true };
 
                     } else if torrent.torrent_url.is_some() {
-                        let result = get_torrent_file_content(torrent.torrent_url.clone().unwrap()).await;
+                        let url = torrent.torrent_url.clone().unwrap();
+                        if is_debug_enabled() {
+                            println!("[DEBUG] Downloading torrent from URL: {}", url);
+                        }
+                        let result = get_torrent_location_from_url(url).await;
 
-                        if result.is_ok() {
-                            location = TorrentLocation { content: result.unwrap(), is_magnet: false };
+                        if let Ok(loc) = result {
+                            if is_debug_enabled() {
+                                println!(
+                                    "[DEBUG] Resolved torrent: is_magnet={}, content_len={}",
+                                    loc.is_magnet,
+                                    loc.content.len()
+                                );
+                            }
+                            location = loc;
                         } else {
-                            return Err(result.err().unwrap())
+                            return Err(result.err().unwrap());
                         }
                     } else {
                         return Err("Torrent without URI. Please select another".to_string());

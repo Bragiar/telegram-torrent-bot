@@ -10,6 +10,7 @@ mod telegram;
 mod transmission;
 
 use telegram::handle_message;
+use telegram_bot::MessageId;
 
 use std::error::Error;
 use std::sync::Arc;
@@ -17,6 +18,7 @@ use telegram_bot::types::{MessageKind, UpdateKind};
 use telegram_bot::{AllowedUpdate, Api, UpdatesStream};
 
 use crate::jackett::TelegramJackettResponse;
+
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -43,8 +45,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let responses: Arc<Mutex<Vec<TelegramJackettResponse>>> = Arc::new(Mutex::new(Vec::new()));
-    let torrent_lists: Arc<Mutex<Vec<(Vec<i64>, String)>>> = Arc::new(Mutex::new(Vec::new()));
-    let file_lists: Arc<Mutex<Vec<(Vec<String>, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let torrent_lists: Arc<Mutex<Vec<(Vec<i64>, String, MessageId)>>> = Arc::new(Mutex::new(Vec::new()));
+    let file_lists:   Arc<Mutex<Vec<(Vec<String>, String, MessageId)>>> = Arc::new(Mutex::new(Vec::new()));
 
     let telegram_token = env::var("TELEGRAM_BOT_TOKEN").expect("TELEGRAM_BOT_TOKEN not set");
 

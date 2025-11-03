@@ -89,26 +89,6 @@ async fn request_transmission_rpc(
     client.request(request).await
 }
 
-async fn request_transmission(
-    client: &client::Client<hyper_rustls::HttpsConnector<client::HttpConnector>>,
-    location: TorrentLocation,
-    path: String,
-    token: Option<String>,
-) -> hyper::Result<Response<Body>> {
-    let arguments = if location.is_magnet {
-        json!({
-            "download-dir": path,
-            "filename": location.content,
-        })
-    } else {
-        json!({
-            "download-dir": path,
-            "metainfo": location.content,
-        })
-    };
-
-    request_transmission_rpc(client, "torrent-add", arguments, token).await
-}
 
 async fn request_transmission_with_retry(
     client: &client::Client<hyper_rustls::HttpsConnector<client::HttpConnector>>,
@@ -147,12 +127,44 @@ async fn request_transmission_with_retry(
     }
 }
 
+fn is_debug_enabled() -> bool {
+    env::var("DEBUG_TORRENT").is_ok()
+}
+
 async fn request_add_torrent(location: TorrentLocation, path: String) -> Result<(), String> {
     let https = hyper_rustls::HttpsConnector::with_native_roots();
     let client: client::Client<_> = client::Client::builder().build(https);
 
-    let transmission_response =
-        request_transmission(&client, location.clone(), path.clone(), None).await;
+    if is_debug_enabled() {
+        println!("[DEBUG] Adding torrent - is_magnet: {}, content_length: {}", location.is_magnet, location.content.len());
+    }
+
+    let arguments = if location.is_magnet {
+        if location.content.len() < 10 || !location.content.starts_with("magnet:") {
+            return Err(format!("Invalid magnet link: {}", location.content.chars().take(50).collect::<String>()));
+        }
+        if is_debug_enabled() {
+            println!("[DEBUG] Using magnet link (length: {} chars)", location.content.len());
+        }
+        json!({
+            "download-dir": path,
+            "filename": location.content,
+        })
+    } else {
+        if is_debug_enabled() {
+            println!("[DEBUG] Using torrent file (base64 length: {} chars)", location.content.len());
+        }
+        json!({
+            "download-dir": path,
+            "metainfo": location.content,
+        })
+    };
+    
+    if is_debug_enabled() {
+        println!("[DEBUG] Request arguments: download-dir={}, has_content={}", path, !location.content.is_empty());
+    }
+
+    let transmission_response = request_transmission_rpc(&client, "torrent-add", arguments.clone(), None).await;
 
     if transmission_response.is_err() {
         return Err("Transmission replied with error".to_string());
@@ -163,13 +175,78 @@ async fn request_add_torrent(location: TorrentLocation, path: String) -> Result<
         let headers = response.headers();
         let header_value = headers.get("X-Transmission-Session-Id");
         if header_value.is_none() {
-            return Err("First request to transmission didn't bring the token {}".to_string());
+            return Err("First request to transmission didn't bring the token".to_string());
         }
 
         let session_value = header_value.unwrap().to_str().unwrap().to_string();
-        request_transmission(&client, location.clone(), path.clone(), Some(session_value))
+        let retry_response = request_transmission_rpc(&client, "torrent-add", arguments, Some(session_value))
+            .await;
+        
+        if retry_response.is_err() {
+            return Err("Transmission retry failed".to_string());
+        }
+        
+        let final_response = retry_response.unwrap();
+        
+        // Read response body to check what Transmission actually said
+        let body_bytes = hyper::body::to_bytes(final_response.into_body())
             .await
-            .unwrap();
+            .map_err(|e| format!("Failed to read response body: {}", e))?;
+        
+        let response_text = String::from_utf8_lossy(&body_bytes);
+        if is_debug_enabled() {
+            println!("[DEBUG] Transmission response: {}", response_text);
+        }
+        
+        // Parse to check for errors
+        let transmission_response: Result<TransmissionResponse, _> = serde_json::from_slice(&body_bytes);
+        
+        if let Ok(trans_resp) = transmission_response {
+            if trans_resp.result != "success" {
+                return Err(format!("Transmission error: {}", trans_resp.result));
+            }
+            
+            // Check for torrent-add specific errors
+            if let Some(args) = trans_resp.arguments {
+                if let Some(error) = args.get("torrent-duplicate") {
+                    if error != &serde_json::json!(null) {
+                        return Err("Torrent already exists in Transmission".to_string());
+                    }
+                }
+                // Check for any error messages
+                if let Some(result_code) = args.get("result").and_then(|v| v.as_str()) {
+                    if result_code != "success" {
+                        return Err(format!("Transmission reported error: {}", result_code));
+                    }
+                }
+            }
+        } else {
+            if is_debug_enabled() {
+                println!("[DEBUG] Warning: Could not parse Transmission response as JSON");
+            }
+        }
+        
+        Ok(())
+    } else if response.status().is_success() {
+        // Read response body to check what Transmission actually said
+        let body_bytes = hyper::body::to_bytes(response.into_body())
+            .await
+            .map_err(|e| format!("Failed to read response body: {}", e))?;
+        
+        let response_text = String::from_utf8_lossy(&body_bytes);
+        if is_debug_enabled() {
+            println!("[DEBUG] Transmission response: {}", response_text);
+        }
+        
+        // Parse to check for errors
+        let transmission_response: Result<TransmissionResponse, _> = serde_json::from_slice(&body_bytes);
+        
+        if let Ok(trans_resp) = transmission_response {
+            if trans_resp.result != "success" {
+                return Err(format!("Transmission error: {}", trans_resp.result));
+            }
+        }
+        
         Ok(())
     } else {
         Err(format!("Error on transmission {}", response.status()))
