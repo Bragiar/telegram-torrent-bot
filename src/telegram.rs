@@ -25,6 +25,7 @@ const HELP: &str = "
 /delete-torrent - List all downloads (reply with number to delete torrent)
 /delete-tv - List TV shows files (reply with number to delete file)
 /delete-movie - List movie files (reply with number to delete file)
+/restructure <tv|movie> - Scan and reorganize media files
 /stop-seed - Stop seeding for all downloads
 /storage - Get available storage information
 
@@ -352,6 +353,7 @@ pub async fn send_message(api: &Api, message: &Message, text: String) -> Result<
 enum PendingList {
     Torrent(Vec<i64>),
     File(Vec<String>),
+    Restructure(crate::restructure::RestructurePlan),
 }
 
 async fn add_response(
@@ -400,6 +402,25 @@ async fn add_file_list(
     text
 }
 
+async fn add_restructure_plan(
+    text: String,
+    plan: crate::restructure::RestructurePlan,
+    plans: &mut Arc<Mutex<Vec<(crate::restructure::RestructurePlan, String, MessageId)>>>,
+    message_id: MessageId,
+) -> String {
+    let mut p = plans.lock().await;
+    p.push((plan, text.clone(), message_id));
+    // Keep only last 100 plans to avoid memory issues
+    if p.len() > 100 {
+        p.remove(0);
+    }
+    text
+}
+
+fn transmission_path(env_var: String) -> Result<String, String> {
+    env::var(&env_var).map_err(|_| format!("{} env var is not set", env_var))
+}
+
 pub async fn handle_message(
     api: &Api,
     message: &Message,
@@ -407,6 +428,7 @@ pub async fn handle_message(
     responses: &mut Arc<Mutex<Vec<TelegramJackettResponse>>>,
     torrent_lists: &mut Arc<Mutex<Vec<(Vec<i64>, String, MessageId)>>>,
     file_lists: &mut Arc<Mutex<Vec<(Vec<String>, String, MessageId)>>>,
+    restructure_plans: &mut Arc<Mutex<Vec<(crate::restructure::RestructurePlan, String, MessageId)>>>,
 ) -> Result<(), ()> {
     let chat_id = message.chat.id();
     let mut result: Result<String, String> = Err("🤷🏻‍I didn't get it!".to_string());
@@ -477,6 +499,40 @@ pub async fn handle_message(
                         drop(lists);
                     }
 
+                    // 3) if not matched, check RESTRUCTURE plans
+                    if !matched {
+                        let restructure_guard = restructure_plans.lock().await;
+                        for (plan, _list_text, stored_id) in restructure_guard.iter() {
+                            let reply_msg_id = match *reply {
+                                telegram_bot::MessageOrChannelPost::Message(ref m) => m.id,
+                                telegram_bot::MessageOrChannelPost::ChannelPost(ref cp) => cp.id,
+                            };
+                            if reply_msg_id == *stored_id {
+                                // Check for cancel
+                                if prefix.to_lowercase().trim() == "cancel" {
+                                    result = Ok("❌ Restructure cancelled".to_string());
+                                    matched = true;
+                                    break;
+                                }
+
+                                // Parse reply and execute
+                                let full_reply = text.join(" ");
+                                match crate::restructure::parse_restructure_reply(&full_reply, plan) {
+                                    Ok(operations) => {
+                                        drop(restructure_guard);
+                                        result = crate::restructure::execute_moves(&operations).await;
+                                        matched = true;
+                                    }
+                                    Err(e) => {
+                                        result = Err(e);
+                                        matched = true;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+
                     // If not a delete reply, try Jackett response
                     if !matched {
                         let r = responses.lock().await;
@@ -543,6 +599,45 @@ pub async fn handle_message(
                     Err(e) => Err(e),
                 }
             }
+            "/restructure" => {
+                if text.len() < 2 {
+                    Err("Usage: /restructure <tv|movie>".to_string())
+                } else {
+                    let media = match text[1].to_lowercase().as_str() {
+                        "tv" => Some(Media::TV),
+                        "movie" => Some(Media::Movie),
+                        _ => None,
+                    };
+
+                    match media {
+                        Some(m) => {
+                            let env_var = match m {
+                                Media::TV => "TRANSMISSION_TV_PATH".to_string(),
+                                Media::Movie => "TRANSMISSION_MOVIE_PATH".to_string(),
+                            };
+
+                            match transmission_path(env_var) {
+                                Ok(base_path) => {
+                                    match crate::restructure::generate_restructure_plan(m, &base_path).await {
+                                        Ok(plan) => {
+                                            if plan.operations.is_empty() && plan.unparseable_files.is_empty() {
+                                                Ok("✅ Nothing to restructure".to_string())
+                                            } else {
+                                                let text = crate::restructure::format_restructure_plan(&plan);
+                                                pending_list = Some(PendingList::Restructure(plan));
+                                                Ok(text)
+                                            }
+                                        }
+                                        Err(e) => Err(e),
+                                    }
+                                }
+                                Err(e) => Err(e),
+                            }
+                        }
+                        None => Err("Invalid media type. Use 'tv' or 'movie'".to_string()),
+                    }
+                }
+            }
             "/stop-seed" => dispatch_stop_seed().await,
             "/storage" => dispatch_storage().await,
             _ => result,
@@ -562,6 +657,9 @@ pub async fn handle_message(
                             }
                             PendingList::File(paths) => {
                                 let _ = add_file_list(text, paths, file_lists, sent_id).await;
+                            }
+                            PendingList::Restructure(plan) => {
+                                let _ = add_restructure_plan(text, plan, restructure_plans, sent_id).await;
                             }
                         }
                     }

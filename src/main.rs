@@ -6,6 +6,7 @@ use futures::StreamExt;
 
 mod imdb;
 mod jackett;
+mod restructure;
 mod telegram;
 mod transmission;
 
@@ -47,6 +48,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let responses: Arc<Mutex<Vec<TelegramJackettResponse>>> = Arc::new(Mutex::new(Vec::new()));
     let torrent_lists: Arc<Mutex<Vec<(Vec<i64>, String, MessageId)>>> = Arc::new(Mutex::new(Vec::new()));
     let file_lists:   Arc<Mutex<Vec<(Vec<String>, String, MessageId)>>> = Arc::new(Mutex::new(Vec::new()));
+    let restructure_plans: Arc<Mutex<Vec<(restructure::RestructurePlan, String, MessageId)>>> = Arc::new(Mutex::new(Vec::new()));
 
     let telegram_token = env::var("TELEGRAM_BOT_TOKEN").expect("TELEGRAM_BOT_TOKEN not set");
 
@@ -72,10 +74,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let mut shared_responses = Arc::clone(&responses);
         let mut shared_torrent_lists = Arc::clone(&torrent_lists);
         let mut shared_file_lists = Arc::clone(&file_lists);
+        let mut shared_restructure_plans = Arc::clone(&restructure_plans);
         let data_cloned = data.clone();
 
         tokio::spawn(async move {
-            let handle = handle_message(&cloned_api, &message, text, &mut shared_responses, &mut shared_torrent_lists, &mut shared_file_lists);
+            let handle = handle_message(&cloned_api, &message, text, &mut shared_responses, &mut shared_torrent_lists, &mut shared_file_lists, &mut shared_restructure_plans);
             if (handle.await).is_err() {
                 let error_msg = format!(
                     "Errors should be handled in handle_message {:?}",
