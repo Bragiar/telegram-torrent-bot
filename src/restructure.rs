@@ -436,10 +436,10 @@ pub fn format_restructure_plan(plan: &RestructurePlan) -> String {
         if !op.is_subtitle {
             current_index += 1;
 
-            // Stop at 50 operations to avoid message size limits
-            if current_index > 50 {
+            // Stop at 10 operations to avoid message size limits
+            if current_index > 10 {
                 output.push_str(&format!(
-                    "\n... and {} more operations (showing first 50)\n",
+                    "\n... and {} more operations (showing first 10)\n",
                     plan.operations.len() - i
                 ));
                 break;
@@ -493,7 +493,7 @@ pub fn format_restructure_plan(plan: &RestructurePlan) -> String {
     }
 
     output.push_str("\nReply with:\n");
-    output.push_str("• \"apply all\" - Execute all operations\n");
+    output.push_str("• \"all\" - Execute all operations\n");
     output.push_str("• \"apply 1 2 5\" - Execute specific operations\n");
     output.push_str("• \"cancel\" - Cancel restructure\n");
 
@@ -511,7 +511,7 @@ pub fn parse_restructure_reply(
         return Err("Restructure cancelled".to_string());
     }
 
-    if reply == "apply all" || reply == "apply" {
+    if reply == "apply all" || reply == "apply" || reply == "all" {
         return Ok(plan.operations.clone());
     }
 
