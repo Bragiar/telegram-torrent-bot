@@ -11,6 +11,7 @@ pub struct GuessitMetadata {
     pub year: Option<i32>,
     pub season: Option<u32>,
     pub episode: Option<serde_json::Value>,  // Can be single number or array
+    #[serde(default)]
     pub extension: String,
 }
 
