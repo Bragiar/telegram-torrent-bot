@@ -460,90 +460,93 @@ pub async fn handle_message(
                 }
             }
 
-            if let Some(num) = num {
-                if let Some(reply_text) = reply.text() {
-                    let mut matched = false;
-                    
-                    // 1) check FILE lists only if reply_text exactly matches a stored FILE list text
-                    {
-                        let file_lists_guard = file_lists.lock().await;
-                        for (file_paths, _list_text, stored_id) in file_lists_guard.iter() {
-                            let reply_msg_id = match *reply {
-                                telegram_bot::MessageOrChannelPost::Message(ref m) => m.id,
-                                telegram_bot::MessageOrChannelPost::ChannelPost(ref cp) => cp.id,
-                            };
-                            if reply_msg_id == *stored_id {
-                                let paths = file_paths.clone();
-                                drop(file_lists_guard);
-                                result = dispatch_delete_file(num as usize, paths).await;
-                                matched = true;
-                                break;
+            // Check restructure plans first — these don't need a numeric index
+            let mut restructure_matched = false;
+            {
+                let restructure_guard = restructure_plans.lock().await;
+                for (plan, _list_text, stored_id) in restructure_guard.iter() {
+                    let reply_msg_id = match *reply {
+                        telegram_bot::MessageOrChannelPost::Message(ref m) => m.id,
+                        telegram_bot::MessageOrChannelPost::ChannelPost(ref cp) => cp.id,
+                    };
+                    if reply_msg_id == *stored_id {
+                        // Check for cancel
+                        if prefix.to_lowercase().trim() == "cancel" {
+                            result = Ok("❌ Restructure cancelled".to_string());
+                            restructure_matched = true;
+                            break;
+                        }
+
+                        // Parse reply and execute
+                        let full_reply = text.join(" ");
+                        match crate::restructure::parse_restructure_reply(&full_reply, plan) {
+                            Ok(operations) => {
+                                drop(restructure_guard);
+                                result = crate::restructure::execute_moves(&operations).await;
+                                restructure_matched = true;
+                            }
+                            Err(e) => {
+                                result = Err(e);
+                                restructure_matched = true;
                             }
                         }
+                        break;
                     }
+                }
+            }
 
-                    // 2) if not matched, check TORRENT lists only if reply_text exactly matches a stored TORRENT list text
-                    if !matched {
-                        let lists = torrent_lists.lock().await;
-                        for (torrent_ids, _list_text, stored_id) in lists.iter() {
-                            let reply_msg_id = match *reply {
-                                telegram_bot::MessageOrChannelPost::Message(ref m) => m.id,
-                                telegram_bot::MessageOrChannelPost::ChannelPost(ref cp) => cp.id,
-                            };
-                            if reply_msg_id == *stored_id {
-                                result = dispatch_delete(num as usize, torrent_ids.clone()).await;
-                                matched = true;
-                                break;
-                            }
-                        }
-                        drop(lists);
-                    }
+            if !restructure_matched {
+                if let Some(num) = num {
+                    if let Some(reply_text) = reply.text() {
+                        let mut matched = false;
 
-                    // 3) if not matched, check RESTRUCTURE plans
-                    if !matched {
-                        let restructure_guard = restructure_plans.lock().await;
-                        for (plan, _list_text, stored_id) in restructure_guard.iter() {
-                            let reply_msg_id = match *reply {
-                                telegram_bot::MessageOrChannelPost::Message(ref m) => m.id,
-                                telegram_bot::MessageOrChannelPost::ChannelPost(ref cp) => cp.id,
-                            };
-                            if reply_msg_id == *stored_id {
-                                // Check for cancel
-                                if prefix.to_lowercase().trim() == "cancel" {
-                                    result = Ok("❌ Restructure cancelled".to_string());
+                        // 1) check FILE lists
+                        {
+                            let file_lists_guard = file_lists.lock().await;
+                            for (file_paths, _list_text, stored_id) in file_lists_guard.iter() {
+                                let reply_msg_id = match *reply {
+                                    telegram_bot::MessageOrChannelPost::Message(ref m) => m.id,
+                                    telegram_bot::MessageOrChannelPost::ChannelPost(ref cp) => cp.id,
+                                };
+                                if reply_msg_id == *stored_id {
+                                    let paths = file_paths.clone();
+                                    drop(file_lists_guard);
+                                    result = dispatch_delete_file(num as usize, paths).await;
                                     matched = true;
                                     break;
                                 }
-
-                                // Parse reply and execute
-                                let full_reply = text.join(" ");
-                                match crate::restructure::parse_restructure_reply(&full_reply, plan) {
-                                    Ok(operations) => {
-                                        drop(restructure_guard);
-                                        result = crate::restructure::execute_moves(&operations).await;
-                                        matched = true;
-                                    }
-                                    Err(e) => {
-                                        result = Err(e);
-                                        matched = true;
-                                    }
-                                }
-                                break;
                             }
                         }
-                    }
 
-                    // If not a delete reply, try Jackett response
-                    if !matched {
-                        let r = responses.lock().await;
-                        result = pick_choices(num, reply_text, r.clone(), media).await;
+                        // 2) if not matched, check TORRENT lists
+                        if !matched {
+                            let lists = torrent_lists.lock().await;
+                            for (torrent_ids, _list_text, stored_id) in lists.iter() {
+                                let reply_msg_id = match *reply {
+                                    telegram_bot::MessageOrChannelPost::Message(ref m) => m.id,
+                                    telegram_bot::MessageOrChannelPost::ChannelPost(ref cp) => cp.id,
+                                };
+                                if reply_msg_id == *stored_id {
+                                    result = dispatch_delete(num as usize, torrent_ids.clone()).await;
+                                    matched = true;
+                                    break;
+                                }
+                            }
+                            drop(lists);
+                        }
+
+                        // 3) If not a delete reply, try Jackett response
+                        if !matched {
+                            let r = responses.lock().await;
+                            result = pick_choices(num, reply_text, r.clone(), media).await;
+                        }
                     }
+                } else {
+                    result = Err(
+                        "Not a number.\nPossible solutions: (index), movie (index) or tv (index) "
+                            .to_string(),
+                    )
                 }
-            } else {
-                result = Err(
-                    "Not a number.\nPossible solutions: (index), movie (index) or tv (index) "
-                        .to_string(),
-                )
             }
         }
 
