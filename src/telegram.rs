@@ -611,12 +611,21 @@ pub async fn handle_message(
 
                     match media {
                         Some(m) => {
-                            let env_var = match m {
+                            let actual_env_var = match m {
+                                Media::TV => "ACTUAL_TV_PATH",
+                                Media::Movie => "ACTUAL_MOVIE_PATH",
+                            };
+                            let transmission_env_var = match m {
                                 Media::TV => "TRANSMISSION_TV_PATH".to_string(),
                                 Media::Movie => "TRANSMISSION_MOVIE_PATH".to_string(),
                             };
 
-                            match transmission_path(env_var) {
+                            let base_path_result = env::var(actual_env_var)
+                                .ok()
+                                .map(Ok)
+                                .unwrap_or_else(|| transmission_path(transmission_env_var));
+
+                            match base_path_result {
                                 Ok(base_path) => {
                                     match crate::restructure::generate_restructure_plan(m, &base_path).await {
                                         Ok(plan) => {
