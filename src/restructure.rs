@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::collections::HashSet;
 use tokio::process::Command;
 use std::time::Duration;
 
@@ -86,12 +87,15 @@ fn scan_files_recursive(dir: &str, extensions: &[&str]) -> Result<Vec<String>, S
                 }
             }
 
+            if entry.file_type().map_err(|e| e.to_string())?.is_symlink() {
+                continue;
+            }
             if entry_path.is_dir() {
                 walk_dir(&entry_path, extensions, files)?;
             } else if entry_path.is_file() {
                 if let Some(ext) = entry_path.extension() {
                     if let Some(ext_str) = ext.to_str() {
-                        let ext_with_dot = format!(".{}", ext_str);
+                        let ext_with_dot = format!(".{}", ext_str.to_lowercase());
                         if extensions.contains(&ext_with_dot.as_str()) {
                             files.push(entry_path.to_string_lossy().to_string());
                         }
@@ -109,14 +113,18 @@ fn scan_files_recursive(dir: &str, extensions: &[&str]) -> Result<Vec<String>, S
 }
 
 /// Call guessit CLI to extract metadata
-async fn call_guessit(file_path: &str) -> Result<GuessitMetadata, String> {
+async fn call_guessit(file_path: &str, media: &Media) -> Result<GuessitMetadata, String> {
     let timeout = Duration::from_secs(5);
 
     let output = tokio::time::timeout(
         timeout,
-        Command::new("guessit")
+        Command::new(guessit_executable())
+            .kill_on_drop(true)
             .arg("-j")
-            .arg(file_path)
+            .arg("-t")
+            .arg(match media { Media::TV => "episode", Media::Movie => "movie" })
+            .arg("--")
+            .arg(Path::new(file_path).file_name().ok_or("Missing filename")?)
             .output()
     )
     .await
@@ -169,7 +177,7 @@ fn generate_tv_path(base: &str, metadata: &GuessitMetadata) -> Result<String, St
         return Err("TV show missing episode number".to_string());
     }
 
-    let title = sanitize_filename(&metadata.title);
+    let title = safe_title(&metadata.title)?;
     let season_str = format!("{:02}", season);
 
     // Sort episodes and format as E01-E03 for multi-episode
@@ -200,7 +208,7 @@ fn generate_tv_path(base: &str, metadata: &GuessitMetadata) -> Result<String, St
 
 /// Generate movie path
 fn generate_movie_path(base: &str, metadata: &GuessitMetadata) -> Result<String, String> {
-    let title = sanitize_filename(&metadata.title);
+    let title = safe_title(&metadata.title)?;
 
     let folder_name = if let Some(year) = metadata.year {
         format!("{} ({})", title, year)
@@ -217,33 +225,43 @@ fn generate_movie_path(base: &str, metadata: &GuessitMetadata) -> Result<String,
     Ok(path.to_string_lossy().to_string())
 }
 
-/// Resolve file collisions by appending -1, -2, etc.
-fn resolve_collision(target_path: &str) -> String {
-    let path = Path::new(target_path);
+fn guessit_executable() -> PathBuf {
+    std::env::var_os("GUESSIT_PATH").map(PathBuf::from).unwrap_or_else(|| {
+        let local = PathBuf::from(".guessit-venv/bin/guessit");
+        if local.is_file() { local } else { PathBuf::from("guessit") }
+    })
+}
 
-    if !path.exists() {
-        return target_path.to_string();
+// Existing curated folders are authoritative. Re-parsing them can strip words
+// such as "Us" from show titles or mistake episode extras for separate shows.
+fn already_curated(base: &str, file: &str, media: &Media) -> bool {
+    let Ok(relative) = Path::new(file).strip_prefix(base) else { return false; };
+    let parts: Vec<_> = relative.iter().filter_map(|p| p.to_str()).collect();
+    if parts.iter().any(|p| matches!(*p, "Featurettes" | "Interviews" | "Behind The Scenes" | "Deleted Scenes" | "Trailers")) {
+        return true;
     }
-
-    let parent = path.parent().unwrap_or_else(|| Path::new(""));
-    let file_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-    let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-
-    for i in 1..=100 {
-        let new_name = if extension.is_empty() {
-            format!("{}-{}", file_stem, i)
-        } else {
-            format!("{}-{}.{}", file_stem, i, extension)
-        };
-
-        let new_path = parent.join(new_name);
-        if !new_path.exists() {
-            return new_path.to_string_lossy().to_string();
-        }
+    match media {
+        Media::TV => parts.len() == 3 && parts[1].strip_prefix("Season ")
+            .map(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())).unwrap_or(false),
+        Media::Movie => parts.len() == 2 && parts[0].rsplit_once(" (")
+            .map(|(_, year)| year.len() == 5 && year.ends_with(')')
+                && year[..4].chars().all(|c| c.is_ascii_digit())).unwrap_or(false),
     }
+}
 
-    // Fallback if we hit max iterations
-    target_path.to_string()
+fn safe_title(title: &str) -> Result<String, String> {
+    let title = sanitize_filename(title).trim().trim_end_matches('.').to_string();
+    if title.is_empty() || title == "." || title == ".." {
+        return Err("Invalid or empty media title".into());
+    }
+    Ok(title)
+}
+
+// Only standardize folders. Keep the entire release filename for subtitles.
+fn preserve_filename(target: &str, source: &str) -> Result<String, String> {
+    let parent = Path::new(target).parent().ok_or("Missing target directory")?;
+    let name = Path::new(source).file_name().ok_or("Missing source filename")?;
+    Ok(parent.join(name).to_string_lossy().to_string())
 }
 
 /// Find matching subtitle files for a video file
@@ -269,8 +287,9 @@ fn find_matching_subtitles(video_path: &str) -> Vec<String> {
                 continue;
             }
 
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                let ext_with_dot = format!(".{}", ext);
+            let Some(ext) = path.extension().and_then(|e| e.to_str()) else { continue; };
+            {
+                let ext_with_dot = format!(".{}", ext.to_lowercase());
                 if !SUBTITLE_EXTENSIONS.contains(&ext_with_dot.as_str()) {
                     continue;
                 }
@@ -279,7 +298,7 @@ fn find_matching_subtitles(video_path: &str) -> Vec<String> {
             if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
                 // Match exact name or name with language code
                 // e.g., "show.s01e01.srt" or "show.s01e01.en.srt"
-                if file_name.starts_with(video_stem) {
+                if file_name.strip_prefix(video_stem).map(|rest| rest.starts_with('.')).unwrap_or(false) {
                     subtitles.push(path.to_string_lossy().to_string());
                 }
             }
@@ -295,8 +314,13 @@ pub async fn generate_restructure_plan(
     media: Media,
     base_path: &str,
 ) -> Result<RestructurePlan, String> {
+    // Fail clearly once if the parser is unavailable, instead of silently skipping every file.
+    let check = Command::new(guessit_executable()).arg("--version").kill_on_drop(true).output().await
+        .map_err(|e| format!("GuessIt unavailable: {}", e))?;
+    if !check.status.success() { return Err("GuessIt failed its startup check".into()); }
     // Scan for video files
-    let video_files = scan_files_recursive(base_path, VIDEO_EXTENSIONS)?;
+    let video_files: Vec<_> = scan_files_recursive(base_path, VIDEO_EXTENSIONS)?
+        .into_iter().filter(|file| !already_curated(base_path, file, &media)).collect();
 
     if video_files.is_empty() {
         return Ok(RestructurePlan {
@@ -307,6 +331,7 @@ pub async fn generate_restructure_plan(
     }
 
     let mut operations = Vec::new();
+    let mut reserved = HashSet::new();
     let mut unparseable_files = Vec::new();
 
     // Process files in batches of 10 concurrently
@@ -320,7 +345,7 @@ pub async fn generate_restructure_plan(
             let media = media.clone();
 
             tasks.push(tokio::spawn(async move {
-                (file_path.clone(), call_guessit(&file_path).await, base_path, media)
+                (file_path.clone(), call_guessit(&file_path, &media).await, base_path, media)
             }));
         }
 
@@ -339,7 +364,7 @@ pub async fn generate_restructure_plan(
                     };
 
                     let target_path = match target_path {
-                        Ok(p) => p,
+                        Ok(p) => preserve_filename(&p, &file_path)?,
                         Err(_) => {
                             unparseable_files.push(file_path.clone());
                             continue;
@@ -358,8 +383,12 @@ pub async fn generate_restructure_plan(
                         continue;
                     }
 
-                    // Resolve collisions
-                    let final_target = resolve_collision(&target_path);
+                    // Never invent suffixes or overwrite another release.
+                    if Path::new(&target_path).symlink_metadata().is_ok() || !reserved.insert(target_path.clone()) {
+                        unparseable_files.push(file_path.clone());
+                        continue;
+                    }
+                    let final_target = target_path;
 
                     // Get display name
                     let display_name = Path::new(&file_path)
@@ -390,7 +419,11 @@ pub async fn generate_restructure_plan(
                             .parent()
                             .unwrap_or_else(|| Path::new(""));
                         let sub_target = target_dir.join(&sub_name);
-                        let sub_target = resolve_collision(&sub_target.to_string_lossy());
+                        let sub_target = sub_target.to_string_lossy().to_string();
+                        if Path::new(&sub_target).symlink_metadata().is_ok() || !reserved.insert(sub_target.clone()) {
+                            unparseable_files.push(sub_path);
+                            continue;
+                        }
 
                         operations.push(MoveOperation {
                             source_path: sub_path,
@@ -417,86 +450,29 @@ pub async fn generate_restructure_plan(
 /// Format the restructure plan for display
 pub fn format_restructure_plan(plan: &RestructurePlan) -> String {
     if plan.operations.is_empty() && plan.unparseable_files.is_empty() {
-        return "✅ Nothing to restructure".to_string();
+        return "✅ Nothing to restructure".into();
     }
-
-    let emoji = match plan.media_type {
-        Media::TV => "📺",
-        Media::Movie => "🎬",
-    };
-
-    let mut output = format!("{} Restructure Plan:\n\n", emoji);
-
-    // Group operations by video file (video + its subtitles)
-    let mut current_index = 0;
-    let mut i = 0;
-    while i < plan.operations.len() {
-        let op = &plan.operations[i];
-
-        if !op.is_subtitle {
-            current_index += 1;
-
-            // Stop at 10 operations to avoid message size limits
-            if current_index > 10 {
-                output.push_str(&format!(
-                    "\n... and {} more operations (showing first 10)\n",
-                    plan.operations.len() - i
-                ));
-                break;
-            }
-
-            // Show video file
-            let target_display = Path::new(&op.target_path)
-                .strip_prefix(
-                    Path::new(&op.target_path)
-                        .ancestors()
-                        .nth(2)
-                        .unwrap_or_else(|| Path::new(""))
-                )
-                .unwrap_or_else(|_| Path::new(&op.target_path));
-
-            output.push_str(&format!(
-                "{}. {}\n   → {}\n",
-                current_index,
-                op.display_name,
-                target_display.display()
-            ));
-
-            // Show subtitle files indented
-            let mut j = i + 1;
-            while j < plan.operations.len() && plan.operations[j].is_subtitle {
-                let sub_op = &plan.operations[j];
-                output.push_str(&format!("      + {}\n", sub_op.display_name));
-                j += 1;
-            }
-            i = j;
-        } else {
-            i += 1;
-        }
+    let label = match plan.media_type { Media::TV => "TV", Media::Movie => "Movies" };
+    let total = plan.operations.iter().filter(|op| !op.is_subtitle).count();
+    let mut output = format!("{} restructure: {} videos, {} skipped\nOriginal filenames preserved; existing destinations never overwritten.\n\n", label, total, plan.unparseable_files.len());
+    let mut shown = 0;
+    for op in plan.operations.iter().filter(|op| !op.is_subtitle).take(10) {
+        let row = format!("{}. {}\n → {}\n", shown + 1,
+            crate::torrent_status::html_name(&op.display_name, 100),
+            crate::torrent_status::html_name(&op.target_path, 180));
+        if output.len() + row.len() > 3000 { break; }
+        output.push_str(&row);
+        shown += 1;
     }
-
-    // Add unparseable files warning
+    if shown < total { output.push_str(&format!("\nShowing {}/{} videos.\n", shown, total)); }
     if !plan.unparseable_files.is_empty() {
-        output.push_str("\n⚠️ Unparseable files (will be skipped):\n");
-        for (idx, file) in plan.unparseable_files.iter().take(20).enumerate() {
-            let display = Path::new(file)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(file);
-            output.push_str(&format!("  • {}\n", display));
-
-            if idx == 19 && plan.unparseable_files.len() > 20 {
-                output.push_str(&format!("  ... and {} more\n", plan.unparseable_files.len() - 20));
-                break;
-            }
+        output.push_str("\nSkipped (unparseable or conflicting):\n");
+        for file in plan.unparseable_files.iter().take(3) {
+            let name = Path::new(file).file_name().and_then(|n| n.to_str()).unwrap_or(file);
+            output.push_str(&format!("• {}\n", crate::torrent_status::html_name(name, 100)));
         }
     }
-
-    output.push_str("\nReply with:\n");
-    output.push_str("• \"all\" - Execute all operations\n");
-    output.push_str("• \"apply 1 2 5\" - Execute specific operations\n");
-    output.push_str("• \"cancel\" - Cancel restructure\n");
-
+    output.push_str("\nReply: apply all / apply 1 2 5 / cancel\nMoves do not update Transmission paths; moving seeded files may interrupt seeding.");
     output
 }
 
@@ -600,33 +576,14 @@ pub async fn execute_moves(operations: &[MoveOperation]) -> Result<String, Strin
             }
         }
 
-        // Try rename first (fast, same filesystem)
-        match std::fs::rename(source, target) {
-            Ok(_) => {
-                success_count += 1;
-            }
-            Err(e) => {
-                // If cross-filesystem error, try copy + delete
-                if e.raw_os_error() == Some(18) || e.kind() == std::io::ErrorKind::Other {
-                    match std::fs::copy(source, target) {
-                        Ok(_) => {
-                            if let Err(del_err) = std::fs::remove_file(source) {
-                                errors.push(format!(
-                                    "{}: Copied but failed to delete source - {}",
-                                    op.display_name, del_err
-                                ));
-                            } else {
-                                success_count += 1;
-                            }
-                        }
-                        Err(copy_err) => {
-                            errors.push(format!("{}: Failed to copy - {}", op.display_name, copy_err));
-                        }
-                    }
-                } else {
-                    errors.push(format!("{}: Failed to move - {}", op.display_name, e));
-                }
-            }
+        if source == target { continue; }
+        match std::fs::symlink_metadata(source) {
+            Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {},
+            _ => { errors.push(format!("{}: Source missing or not a regular file", op.display_name)); continue; }
+        }
+        match move_no_replace(source, target) {
+            Ok(()) => success_count += 1,
+            Err(e) => errors.push(format!("{}: Move refused (source retained): {}", crate::torrent_status::html_name(&op.display_name, 100), e)),
         }
     }
 
@@ -648,5 +605,85 @@ pub async fn execute_moves(operations: &[MoveOperation]) -> Result<String, Strin
         Err(result)
     } else {
         Ok(result)
+    }
+}
+
+// Linux renameat2 provides atomic no-overwrite moves, including on exFAT.
+#[cfg(target_os = "linux")]
+fn move_no_replace(source: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::ffi::CString;
+    extern "C" {
+        fn renameat2(oldfd: i32, old: *const std::os::raw::c_char,
+                     newfd: i32, new: *const std::os::raw::c_char, flags: u32) -> i32;
+    }
+    let source = CString::new(source.as_os_str().as_bytes())?;
+    let target = CString::new(target.as_os_str().as_bytes())?;
+    let result = unsafe { renameat2(-100, source.as_ptr(), -100, target.as_ptr(), 1) };
+    if result == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+#[cfg(not(target_os = "linux"))]
+fn move_no_replace(_: &Path, _: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "Safe moves require Linux renameat2"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn curated_titles_and_bonus_features_are_not_reparsed() {
+        assert!(already_curated("/tv", "/tv/When They See Us/Season 01/release.mkv", &Media::TV));
+        assert!(already_curated("/tv", "/tv/Sean Combs - The Reckoning/Season 01/part-1.mkv", &Media::TV));
+        assert!(already_curated("/tv", "/tv/True Detective/Season 01/Featurettes/S01E01 - Preview.mkv", &Media::TV));
+        assert!(already_curated("/movies", "/movies/Dune Part Two (2024)/Dune (2024).mkv", &Media::Movie));
+        assert!(!already_curated("/movies", "/movies/Dune (2024) [1080p]/release.mkv", &Media::Movie));
+        assert!(!already_curated("/tv", "/tv/release-pack/episode.mkv", &Media::TV));
+        assert!(!already_curated("/tv", "/tv/Show/Season nonsense/episode.mkv", &Media::TV));
+    }
+    #[tokio::test]
+    async fn preserved_release_names_subtitles_and_idempotence() {
+        let root = std::env::temp_dir().join(format!("restructure-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let release = "Love.Island.S01E02.1080p.WEB-DL-GROUP.mkv";
+        std::fs::write(root.join(release), b"video").unwrap();
+        std::fs::write(root.join("Love.Island.S01E02.1080p.WEB-DL-GROUP.en.srt"), b"subtitle").unwrap();
+        std::fs::write(root.join("Love.Island.S01E02.1080p.WEB-DL-GROUP-other.srt"), b"unrelated").unwrap();
+        let plan = generate_restructure_plan(Media::TV, root.to_str().unwrap()).await.unwrap();
+        assert_eq!(plan.operations.len(), 2);
+        assert!(plan.operations[0].target_path.ends_with(&format!("Love Island/Season 01/{}", release)));
+        execute_moves(&plan.operations).await.unwrap();
+        assert_eq!(std::fs::read(&plan.operations[0].target_path).unwrap(), b"video");
+        assert_eq!(std::fs::read(&plan.operations[1].target_path).unwrap(), b"subtitle");
+        assert!(generate_restructure_plan(Media::TV, root.to_str().unwrap()).await.unwrap().operations.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn titles_are_safe_and_movie_names_preserved() {
+        assert!(safe_title("..").is_err());
+        let meta = GuessitMetadata { title: "Dune".into(), year: Some(2021), season: None, episode: None, extension: ".mkv".into() };
+        let target = generate_movie_path("/movies", &meta).unwrap();
+        assert_eq!(preserve_filename(&target, "/downloads/Dune.2021.1080p-GROUP.mkv").unwrap(), "/movies/Dune (2021)/Dune.2021.1080p-GROUP.mkv");
+    }
+    #[test]
+    fn preview_is_html_safe_and_bounded() {
+        let op = MoveOperation { source_path: "source".into(), target_path: "<&🦉>".repeat(1000), display_name: "<&🦉>".repeat(1000), is_subtitle: false };
+        let plan = RestructurePlan {media_type: Media::TV, operations: vec![op; 100], unparseable_files: vec!["<&🦉>".repeat(1000); 100]};
+        let text = format_restructure_plan(&plan);
+        assert!(text.len() < 3800);
+        assert!(!text.contains('<'));
+        assert!(text.contains("apply all"));
+        assert!(text.contains("&amp;"));
+    }
+    #[tokio::test]
+    async fn stale_preview_never_overwrites_destination() {
+        let root = std::env::temp_dir().join(format!("restructure-collision-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.mkv"); let target = root.join("target.mkv");
+        std::fs::write(&source, b"source").unwrap(); std::fs::write(&target, b"existing").unwrap();
+        let op = MoveOperation {source_path: source.to_string_lossy().into(), target_path: target.to_string_lossy().into(), display_name: "test".into(), is_subtitle: false};
+        assert!(execute_moves(&[op]).await.is_err());
+        assert_eq!(std::fs::read(source).unwrap(), b"source");
+        assert_eq!(std::fs::read(target).unwrap(), b"existing");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

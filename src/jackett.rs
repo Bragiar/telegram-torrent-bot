@@ -16,19 +16,19 @@ struct Indexer {
 }
 
 #[derive(serde::Deserialize, Clone)]
-struct Torrent {
+pub(crate) struct Torrent {
     #[serde(rename(deserialize = "Seeders"))]
-    seeders: i64,
+    pub(crate) seeders: i64,
     #[serde(rename(deserialize = "MagnetUri"))]
-    magnet_uri: Option<String>,
+    pub(crate) magnet_uri: Option<String>,
     #[serde(rename(deserialize = "Title"))]
-    title: String,
+    pub(crate) title: String,
     #[serde(rename(deserialize = "Category"))]
-    categories: Vec<i64>,
+    pub(crate) categories: Vec<i64>,
     #[serde(rename(deserialize = "Size"))]
-    size: u64,
+    pub(crate) size: u64,
     #[serde(rename(deserialize = "Link"))]
-    torrent_url: Option<String>,
+    pub(crate) torrent_url: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -48,7 +48,7 @@ pub struct TorrentLocation {
 
 #[derive(Clone)]
 pub struct TelegramJackettResponse {
-    torrents: Vec<Torrent>,
+    pub(crate) torrents: Vec<Torrent>,
 }
 
 fn jackett_url() -> String {
@@ -152,12 +152,6 @@ pub async fn request_jackett(query_string: String) -> Result<TelegramJackettResp
     Ok(response)
 }
 
-pub fn format_telegram_response(response: TelegramJackettResponse) -> String {
-    let info = format_torrent(response);
-
-    format!("<pre>{}</pre>", info)
-}
-
 fn format_torrent(response: TelegramJackettResponse) -> String {
     return response
         .torrents
@@ -180,11 +174,7 @@ fn is_movie(categories: Vec<i64>) -> bool {
 }
 
 fn is_tv_show(categories: Vec<i64>) -> bool {
-    return categories.iter().any(|c| c >= &3000 && c < &4000);
-}
-
-fn is_debug_enabled() -> bool {
-    env::var("DEBUG_TORRENT").is_ok()
+    return categories.iter().any(|c| c >= &5000 && c < &6000);
 }
 
 pub async fn get_torrent_location_from_url(torrent_url: String) -> Result<TorrentLocation, String> {
@@ -253,7 +243,7 @@ pub async fn dispatch_from_reply(
     reply_text: String,
     torrents: Vec<TelegramJackettResponse>,
 ) -> Result<(Option<Media>, TorrentLocation), String> {
-    let real_index = index - 1;
+    let real_index = index.checked_sub(1).ok_or_else(|| "Invalid index".to_string())?;
 
     let jackett = torrents.clone().into_iter().find(|response| {
         let decoded_response = decode_html_entities(
@@ -271,48 +261,7 @@ pub async fn dispatch_from_reply(
 
             match torrent {
                 Some(torrent) => {
-                    let location: TorrentLocation;
-
-                    if torrent.magnet_uri.is_some() {
-                        let magnet = torrent.magnet_uri.clone().unwrap();
-                        if is_debug_enabled() {
-                            println!("[DEBUG] Using magnet URI (length: {})", magnet.len());
-                        }
-                        if magnet.is_empty() {
-                            return Err("Torrent has empty magnet URI. Please select another".to_string());
-                        }
-                        location = TorrentLocation { content: magnet, is_magnet: true };
-
-                    } else if torrent.torrent_url.is_some() {
-                        let url = torrent.torrent_url.clone().unwrap();
-                        if is_debug_enabled() {
-                            println!("[DEBUG] Downloading torrent from URL: {}", url);
-                        }
-                        let result = get_torrent_location_from_url(url).await;
-
-                        if let Ok(loc) = result {
-                            if is_debug_enabled() {
-                                println!(
-                                    "[DEBUG] Resolved torrent: is_magnet={}, content_len={}",
-                                    loc.is_magnet,
-                                    loc.content.len()
-                                );
-                            }
-                            location = loc;
-                        } else {
-                            return Err(result.err().unwrap());
-                        }
-                    } else {
-                        return Err("Torrent without URI. Please select another".to_string());
-                    }
-
-                    if is_tv_show(torrent.clone().categories) {
-                        return Ok((Some(Media::TV), location));
-                    } else if is_movie(torrent.clone().categories) {
-                        return Ok((Some(Media::Movie), location));
-                    } else {
-                        return Ok((None, location));
-                    }
+                    Ok((torrent.media(), torrent.location().await?))
                 }
                 None => Err("No torrent for the given index".to_string()),
             }
@@ -330,4 +279,37 @@ fn decode_html_entities(input: String) -> String {
         .replace("&quot;", "\"")
         .replace("&apos;", "'")
         .replace("&#039;", "'")
+}
+
+impl Torrent {
+    pub(crate) fn media(&self) -> Option<Media> {
+        if is_tv_show(self.categories.clone()) { Some(Media::TV) }
+        else if is_movie(self.categories.clone()) { Some(Media::Movie) }
+        else { None }
+    }
+
+    pub(crate) async fn location(&self) -> Result<TorrentLocation, String> {
+        if let Some(magnet) = &self.magnet_uri {
+            if !magnet.is_empty() {
+                return Ok(TorrentLocation { content: magnet.clone(), is_magnet: true });
+            }
+        }
+        if let Some(url) = &self.torrent_url {
+            return get_torrent_location_from_url(url.clone()).await;
+        }
+        Err("Torrent without URI. Please select another".to_string())
+    }
+}
+
+#[cfg(test)]
+mod category_tests {
+    use super::*;
+    #[test]
+    fn standard_jackett_categories_distinguish_tv_movies_and_audio() {
+        assert!(is_tv_show(vec![5000, 5040]));
+        assert!(!is_tv_show(vec![3000, 3040]));
+        assert!(is_movie(vec![2000, 2045]));
+        assert!(!is_movie(vec![5000]));
+        assert!(!is_tv_show(vec![6000]));
+    }
 }

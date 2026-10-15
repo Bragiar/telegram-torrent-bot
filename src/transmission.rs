@@ -6,10 +6,18 @@ use std::env;
 
 use crate::jackett::TorrentLocation;
 
-fn transmission_path(env: String) -> Result<String, String> {
-    env::var(env).map_err(|_| {
-        "TRANSMISSION_TV_PATH or TRANSMISSION_MOVIE_PATH env var is not set".to_string()
-    })
+pub(crate) fn download_path(media: &Media) -> Result<String, String> {
+    // Use the same precedence as the organizer and library browser. Legacy
+    // Transmission roots remain browsable, but must not divert new downloads.
+    let roots = crate::delete_picker::roots(media)?;
+    let root = roots.first().ok_or("Download destination is not configured")?;
+    let path = root.canonicalize()
+        .map_err(|e| format!("Cannot access download destination {}: {}", root.display(), e))?;
+    if !path.is_dir() {
+        return Err(format!("Download destination {} is not a directory", path.display()));
+    }
+    path.to_str().map(str::to_owned)
+        .ok_or_else(|| "Download destination is not valid UTF-8".to_string())
 }
 
 fn transmission_url() -> String {
@@ -32,6 +40,8 @@ struct TransmissionResponse {
 pub struct Torrent {
     pub id: i64,
     pub name: String,
+    #[serde(rename = "addedDate")]
+    pub added_date: i64,
     pub status: i64,
     #[serde(rename = "percentDone")]
     pub percent_done: f64,
@@ -254,10 +264,7 @@ async fn request_add_torrent(location: TorrentLocation, path: String) -> Result<
 }
 
 pub async fn add_torrent(location: TorrentLocation, media: Media) -> Result<(), String> {
-    let path = match media {
-        Media::TV => transmission_path("TRANSMISSION_TV_PATH".to_string())?,
-        Media::Movie => transmission_path("TRANSMISSION_MOVIE_PATH".to_string())?,
-    };
+    let path = download_path(&media)?;
 
     request_add_torrent(location, path.clone()).await?;
     Ok(())
@@ -269,7 +276,7 @@ pub async fn get_torrents() -> Result<Vec<Torrent>, String> {
 
     let arguments = json!({
         "fields": [
-            "id", "name", "status", "percentDone", "downloadDir",
+            "id", "name", "addedDate", "status", "percentDone", "downloadDir",
             "totalSize", "downloadedEver", "uploadedEver",
             "seedRatioLimit", "seedIdleLimit"
         ]

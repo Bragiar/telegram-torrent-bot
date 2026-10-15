@@ -2,3 +2,4 @@ target/
 
 telegram-bot-torrents*
 .env
+.guessit-venv/

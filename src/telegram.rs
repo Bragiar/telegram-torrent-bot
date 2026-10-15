@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::imdb::get_imdb_info;
 use crate::jackett::{
-    dispatch_from_reply, format_telegram_response, request_jackett, TelegramJackettResponse,
+    dispatch_from_reply, request_jackett, TelegramJackettResponse,
     TorrentLocation,
 };
 use crate::transmission::{
@@ -17,26 +17,31 @@ use crate::transmission::{
 };
 
 const HELP: &str = "
-/torrent-tv (Magnet Link)
-/torrent-movie (Magnet Link)
+/help - Show commands and usage
+/chat_id - Show this chat ID
+/torrent_tv (Magnet Link)
+/torrent_movie (Magnet Link)
 /search (Movie or TV Show e.g. The Matrix or Simpsons s01e01)
 /imdb (Imdb link). Requires omdb token set https://www.omdbapi.com/
-/status - Get status of active downloads
-/delete-torrent - List all downloads (reply with number to delete torrent)
-/delete-tv - List TV shows files (reply with number to delete file)
-/delete-movie - List movie files (reply with number to delete file)
+/status - Show the 10 most recently added torrents
+/delete_torrent - List all downloads (reply with number to delete torrent)
+/delete_tv - Browse TV alphabetically and permanently delete with buttons
+/delete_movie - Browse movies alphabetically and permanently delete with buttons
 /restructure <tv|movie> - Scan and reorganize media files
-/stop-seed - Stop seeding for all downloads
+/stop_seed - Stop seeding for all downloads
 /storage - Get available storage information
 
-Reply the magnet links with:
+Search results have buttons: tap a result, then Download as Movie or TV.
+Use Previous / Next for more results. Pickers expire after one hour.
+
+Typed replies also work:
 Position of the torrent
 If jackett doesn't provide a category, it's possible to force with:
 tv (position)
 movie (position)
 ";
 
-fn allowed_groups() -> Vec<ChatId> {
+pub(crate) fn allowed_groups() -> Vec<ChatId> {
     return match env::var("TELEGRAM_ALLOWED_GROUPS") {
         Ok(val) => val
             .split(',')
@@ -55,7 +60,7 @@ async fn dispatch_chat_id(message: Message) -> Result<String, String> {
 
 async fn dispatch_tv(text: Vec<String>) -> Result<String, String> {
     if text.len() <= 1 {
-        return Err("Send the magnet-url after command (/torrent-tv magnet_url)".to_string());
+        return Err("Send the magnet-url after command (/torrent_tv magnet_url)".to_string());
     }
 
     let location = TorrentLocation {
@@ -69,7 +74,7 @@ async fn dispatch_tv(text: Vec<String>) -> Result<String, String> {
 
 async fn dispatch_movie(text: Vec<String>) -> Result<String, String> {
     if text.len() <= 1 {
-        return Err("Send the magnet-url after command (/torrent-movie magnet_url)".to_string());
+        return Err("Send the magnet-url after command (/torrent_movie magnet_url)".to_string());
     }
 
     let location = TorrentLocation {
@@ -124,43 +129,7 @@ async fn pick_choices(
 }
 
 async fn dispatch_status() -> Result<String, String> {
-    use size_format::SizeFormatterSI;
-    
-    let torrents = get_torrents().await?;
-
-    if torrents.is_empty() {
-        return Ok("📊 No active downloads".to_string());
-    }
-
-    let mut status = String::from("📊 Active Downloads:\n\n");
-
-    for torrent in &torrents {
-        let percent = (torrent.percent_done * 100.0) as i64;
-        let status_emoji = match torrent.status {
-            0 => "⏸️",  // Stopped
-            1 => "⏳",   // Queued to verify
-            2 => "🔍",   // Verifying
-            3 => "⏳",   // Queued to download
-            4 => "⬇️",   // Downloading
-            5 => "⏳",   // Queued to seed
-            6 => "⬆️",   // Seeding
-            _ => "❓",
-        };
-
-        let size_str = SizeFormatterSI::new(torrent.total_size as u64).to_string();
-        
-        status.push_str(&format!(
-            "{} {} ({}%)\n  Size: {}, Downloaded: {}, Uploaded: {}\n",
-            status_emoji,
-            torrent.name,
-            percent,
-            size_str,
-            SizeFormatterSI::new(torrent.downloaded_ever as u64).to_string(),
-            SizeFormatterSI::new(torrent.uploaded_ever as u64).to_string()
-        ));
-    }
-
-    Ok(status)
+    Ok(crate::torrent_status::format_status(&get_torrents().await?))
 }
 
 fn format_torrent_list(torrents: &[Torrent], filter: Option<Media>) -> (String, Vec<i64>) {
@@ -233,102 +202,6 @@ async fn dispatch_storage() -> Result<String, String> {
     get_storage_info()
 }
 
-fn list_files_in_directory(dir_path: &str) -> Result<Vec<String>, String> {
-    use std::fs;
-    
-    let entries = fs::read_dir(dir_path)
-        .map_err(|e| format!("Failed to read directory {}: {}", dir_path, e))?;
-    
-    let mut files = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
-        let path = entry.path();
-        
-        if path.is_dir() || path.is_file() {
-            if let Some(file_name) = path.file_name() {
-                if let Some(name_str) = file_name.to_str() {
-                    // Skip hidden files
-                    if !name_str.starts_with('.') {
-                        files.push(path.to_string_lossy().to_string());
-                    }
-                }
-            }
-        }
-    }
-    
-    // Sort files alphabetically
-    files.sort();
-    Ok(files)
-}
-
-fn format_file_list(files: &[String], _base_path: &str) -> (String, Vec<String>) {
-    let mut list = String::new();
-    let mut paths = Vec::new();
-
-    let mut number = 1;
-    for file_path in files {
-        // Get just the file/folder name
-        let display_name = std::path::Path::new(file_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(file_path);
-        
-        list.push_str(&format!(
-            "{}. {}\n",
-            number, display_name
-        ));
-        paths.push(file_path.clone());
-        number += 1;
-    }
-
-    if list.is_empty() {
-        list = "No files found".to_string();
-    } else {
-        list.insert_str(0, "Reply with the number to delete (file):\n\n");
-    }
-
-    (list, paths)
-}
-
-async fn dispatch_delete_file_list(media: Media) -> Result<(String, Vec<String>), String> {
-    let path = match media {
-        Media::TV => env::var("TRANSMISSION_TV_PATH")
-            .map_err(|_| "TRANSMISSION_TV_PATH env var is not set".to_string())?,
-        Media::Movie => env::var("TRANSMISSION_MOVIE_PATH")
-            .map_err(|_| "TRANSMISSION_MOVIE_PATH env var is not set".to_string())?,
-    };
-
-    let files = list_files_in_directory(&path)?;
-    Ok(format_file_list(&files, &path))
-}
-
-async fn dispatch_delete_file(
-    index: usize,
-    file_paths: Vec<String>,
-) -> Result<String, String> {
-    use std::fs;
-    use std::path::Path;
-    
-    if index == 0 || index > file_paths.len() {
-        return Err("Invalid index".to_string());
-    }
-
-    let file_path = &file_paths[index - 1];
-    let path = Path::new(file_path);
-
-    if path.is_dir() {
-        fs::remove_dir_all(path)
-            .map_err(|e| format!("Failed to delete directory: {}", e))?;
-        Ok(format!("🗑️ Directory deleted: {}", path.file_name().unwrap_or_default().to_string_lossy()))
-    } else if path.is_file() {
-        fs::remove_file(path)
-            .map_err(|e| format!("Failed to delete file: {}", e))?;
-        Ok(format!("🗑️ File deleted: {}", path.file_name().unwrap_or_default().to_string_lossy()))
-    } else {
-        Err("Path does not exist".to_string())
-    }
-}
-
 pub async fn send_message(api: &Api, message: &Message, text: String) -> Result<Option<MessageId>, ()> {
     let mut reply = message.text_reply(text);
 
@@ -352,24 +225,7 @@ pub async fn send_message(api: &Api, message: &Message, text: String) -> Result<
 // Holds a pending list to be stored after message is sent and message ID is known
 enum PendingList {
     Torrent(Vec<i64>),
-    File(Vec<String>),
     Restructure(crate::restructure::RestructurePlan),
-}
-
-async fn add_response(
-    response: Result<TelegramJackettResponse, String>,
-    responses: &mut Arc<Mutex<Vec<TelegramJackettResponse>>>,
-) -> Result<String, String> {
-    match response {
-        Ok(response) => {
-            let mut r = responses.lock().await;
-
-            let reply_text = format_telegram_response(response.clone());
-            r.push(response);
-            Ok(reply_text)
-        }
-        Err(err) => Err(err),
-    }
 }
 
 async fn add_torrent_list(
@@ -380,21 +236,6 @@ async fn add_torrent_list(
 ) -> String {
     let mut lists = torrent_lists.lock().await;
     lists.push((torrent_ids, text.clone(), message_id));
-    // Keep only last 100 lists to avoid memory issues
-    if lists.len() > 100 {
-        lists.remove(0);
-    }
-    text
-}
-
-async fn add_file_list(
-    text: String,
-    file_paths: Vec<String>,
-    file_lists: &mut Arc<Mutex<Vec<(Vec<String>, String, MessageId)>>>,
-    message_id: MessageId,
-) -> String {
-    let mut lists = file_lists.lock().await;
-    lists.push((file_paths, text.clone(), message_id));
     // Keep only last 100 lists to avoid memory issues
     if lists.len() > 100 {
         lists.remove(0);
@@ -417,31 +258,30 @@ async fn add_restructure_plan(
     text
 }
 
-fn transmission_path(env_var: String) -> Result<String, String> {
-    env::var(&env_var).map_err(|_| format!("{} env var is not set", env_var))
-}
-
 pub async fn handle_message(
     api: &Api,
     message: &Message,
     text: Vec<String>,
     responses: &mut Arc<Mutex<Vec<TelegramJackettResponse>>>,
     torrent_lists: &mut Arc<Mutex<Vec<(Vec<i64>, String, MessageId)>>>,
-    file_lists: &mut Arc<Mutex<Vec<(Vec<String>, String, MessageId)>>>,
     restructure_plans: &mut Arc<Mutex<Vec<(crate::restructure::RestructurePlan, String, MessageId)>>>,
+    pickers: &crate::search_picker::PickerStore,
+    deletes: &crate::delete_picker::DeleteStore,
 ) -> Result<(), ()> {
     let chat_id = message.chat.id();
     let mut result: Result<String, String> = Err("🤷🏻‍I didn't get it!".to_string());
     let mut pending_list: Option<PendingList> = None;
 
-    let prefix = text.first().unwrap();
-    let suffix = text.last().unwrap();
+    let normalized_prefix = crate::command_menu::normalize_command(text.first().map(String::as_str).unwrap_or(""));
+    let prefix = &normalized_prefix;
+    let suffix = match text.last() { Some(s) => s, None => return Ok(()) };
 
     if prefix.as_str() == "/chat-id" {
         result = dispatch_chat_id(message.clone()).await;
     }
 
     if allowed_groups().is_empty() || allowed_groups().contains(&chat_id) {
+        if !prefix.starts_with('/') && pickers.reply(api, message, &text).await { return Ok(()); }
         if let Some(reply) = message.reply_to_message.clone() {
             let num: Option<u16>;
             let mut media: Option<Media> = None;
@@ -500,24 +340,6 @@ pub async fn handle_message(
                     if let Some(reply_text) = reply.text() {
                         let mut matched = false;
 
-                        // 1) check FILE lists
-                        {
-                            let file_lists_guard = file_lists.lock().await;
-                            for (file_paths, _list_text, stored_id) in file_lists_guard.iter() {
-                                let reply_msg_id = match *reply {
-                                    telegram_bot::MessageOrChannelPost::Message(ref m) => m.id,
-                                    telegram_bot::MessageOrChannelPost::ChannelPost(ref cp) => cp.id,
-                                };
-                                if reply_msg_id == *stored_id {
-                                    let paths = file_paths.clone();
-                                    drop(file_lists_guard);
-                                    result = dispatch_delete_file(num as usize, paths).await;
-                                    matched = true;
-                                    break;
-                                }
-                            }
-                        }
-
                         // 2) if not matched, check TORRENT lists
                         if !matched {
                             let lists = torrent_lists.lock().await;
@@ -563,7 +385,10 @@ pub async fn handle_message(
             }
 
             let response = dispatch_from_imdb_url(url.clone()).await;
-            result = add_response(response, responses).await;
+            match response {
+                Ok(response) => { pickers.send(api, message, response).await.map_err(|e| { eprintln!("Picker send failed: {}", e); })?; return Ok(()); }
+                Err(e) => result = Err(e),
+            }
         };
 
         result = match prefix.as_str() {
@@ -572,7 +397,10 @@ pub async fn handle_message(
             "/help" => Ok(HELP.to_string()),
             "/search" => {
                 let response = dispatch_search(text).await;
-                add_response(response, responses).await
+                match response {
+                    Ok(response) => { pickers.send(api, message, response).await.map_err(|e| { eprintln!("Picker send failed: {}", e); })?; return Ok(()); }
+                    Err(e) => Err(e),
+                }
             }
             "/status" => dispatch_status().await,
             "/delete-torrent" => {
@@ -584,21 +412,10 @@ pub async fn handle_message(
                     Err(e) => Err(e),
                 }
             }
-            "/delete-tv" => {
-                match dispatch_delete_file_list(Media::TV).await {
-                    Ok((text, paths)) => {
-                        pending_list = Some(PendingList::File(paths));
-                        Ok(text)
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-            "/delete-movie" => {
-                match dispatch_delete_file_list(Media::Movie).await {
-                    Ok((text, paths)) => {
-                        pending_list = Some(PendingList::File(paths));
-                        Ok(text)
-                    }
+            "/delete-tv" | "/delete-movie" => {
+                let media = if prefix == "/delete-tv" { Media::TV } else { Media::Movie };
+                match deletes.send(api, message, media).await {
+                    Ok(()) => return Ok(()),
                     Err(e) => Err(e),
                 }
             }
@@ -614,19 +431,8 @@ pub async fn handle_message(
 
                     match media {
                         Some(m) => {
-                            let actual_env_var = match m {
-                                Media::TV => "ACTUAL_TV_PATH",
-                                Media::Movie => "ACTUAL_MOVIE_PATH",
-                            };
-                            let transmission_env_var = match m {
-                                Media::TV => "TRANSMISSION_TV_PATH".to_string(),
-                                Media::Movie => "TRANSMISSION_MOVIE_PATH".to_string(),
-                            };
-
-                            let base_path_result = env::var(actual_env_var)
-                                .ok()
-                                .map(Ok)
-                                .unwrap_or_else(|| transmission_path(transmission_env_var));
+                            let base_path_result = crate::delete_picker::roots(&m)
+                                .map(|paths| paths[0].to_string_lossy().to_string());
 
                             match base_path_result {
                                 Ok(base_path) => {
@@ -666,9 +472,6 @@ pub async fn handle_message(
                             PendingList::Torrent(ids) => {
                                 // store mapping for replies to this message
                                 let _ = add_torrent_list(text, ids, torrent_lists, sent_id).await;
-                            }
-                            PendingList::File(paths) => {
-                                let _ = add_file_list(text, paths, file_lists, sent_id).await;
                             }
                             PendingList::Restructure(plan) => {
                                 let _ = add_restructure_plan(text, plan, restructure_plans, sent_id).await;
